@@ -1,0 +1,334 @@
+---
+title: "Assignment 2: Spatial Analysis"
+author: Desik Somasundaram and Hanna Weyland 
+date: "2021-10-24"
+output: 
+  html_document:
+    theme: flatly
+    code_folding: show
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = FALSE, 
+                      warning = FALSE, 
+                      include = TRUE)
+```
+
+```{r loading packages}
+library(sf)
+library(here)
+library(stringr)
+library(stars)
+library(tidyverse)
+library(spData)
+library(tmap)
+library(rgdal)
+library(rosm)
+```
+
+# Power Crisis in Houston, Texas due to Severe Winter Storms (Feburary 2021)
+## Introduction 
+### In this assignment, we will look at data from severe winter storms that occurred in Texas in Feburary 2021. We will estimate how many homes in Houston, TX went without power as a result of the first two storms as well as investigate the differences in recovery of different suburbs in Houston. We will also look to see if any socioeconomic factors are predictors of a community’s recovery from a power outage.
+
+## Data Analysis
+### Use function to load the DNB dataset from VNP46A1 granules
+```{r}
+read_dnb <- function(file_name) {
+  # Reads the "DNB_At_Sensor_Radiance_500m" dataset from a VNP46A1 granule into a STARS object.
+  # Then read the sinolsoidal tile x/y positions and adjust the STARS dimensions (extent+delta)
+
+  # The name of the dataset holding the nightlight band in the granule
+  dataset_name <- "//HDFEOS/GRIDS/VNP_Grid_DNB/Data_Fields/DNB_At_Sensor_Radiance_500m"
+
+  # From the metadata, we pull out a string containing the horizontal and vertical tile index
+  h_string <- gdal_metadata(file_name)[199]
+  v_string <- gdal_metadata(file_name)[219]
+  
+  # We parse the h/v string to pull out the integer number of h and v
+  tile_h <- as.integer(str_split(h_string, "=", simplify = TRUE)[[2]])
+  tile_v <- as.integer(str_split(v_string, "=", simplify = TRUE)[[2]])
+
+  # From the h/v tile grid position, we get the offset and the extent
+  west <- (10 * tile_h) - 180
+  north <- 90 - (10 * tile_v)
+  east <- west + 10
+  south <- north - 10
+
+  # A tile is 10 degrees and has 2400x2400 grid cells
+  delta <- 10 / 2400
+
+  # Reading the dataset
+  dnb <- read_stars(file_name, sub = dataset_name)
+
+  # Setting the CRS and applying offsets and deltas
+  st_crs(dnb) <- st_crs(4326)
+  st_dimensions(dnb)$x$delta <- delta
+  st_dimensions(dnb)$x$offset <- west
+  st_dimensions(dnb)$y$delta <- -delta
+  st_dimensions(dnb)$y$offset <- north
+  
+  return(dnb)
+}
+```
+
+### Load in night light data from Houston
+```{r}
+# Read in night lights data for before and after data for two tiles covering Houston city
+file_name <- here("data", "VNP46A1", "VNP46A1.A2021038.h08v05.001.2021039064328.h5")
+tile08_05_20210207 <- read_dnb(file_name = file_name)
+
+file_name <- here("data","VNP46A1", "VNP46A1.A2021038.h08v06.001.2021039064329.h5")
+tile08_06_20210207 <- read_dnb(file_name = file_name)
+
+file_name <- here("data","VNP46A1", "VNP46A1.A2021047.h08v05.001.2021048091106.h5")
+tile08_05_20210216 <- read_dnb(file_name = file_name)
+
+file_name <- here("data","VNP46A1", "VNP46A1.A2021047.h08v06.001.2021048091105.h5")
+tile08_06_20210216 <- read_dnb(file_name = file_name)
+```
+
+## Combine the Data
+```{r}
+#Create mosaic of adjacent tiles for both dates
+mosaic_20210207 <- st_mosaic(tile08_05_20210207,tile08_06_20210207)
+mosaic_20210216 <- st_mosaic(tile08_05_20210216,tile08_06_20210216)
+
+#remove clutter from environment
+rm(tile08_05_20210207,tile08_06_20210207,tile08_05_20210216,tile08_06_20210216)
+```
+
+## Create a Blackout Mask
+```{r}
+#Compute difference of mosaic between before and after
+mosaic_diff <- mosaic_20210207 - mosaic_20210216
+#plot(mosaic_diff)
+
+#Filter for locations with drop of more than 200 nW cm-2 sr-1, rest assigned NA
+blackout_mask <- (mosaic_diff) > 200 
+blackout_mask[blackout_mask == FALSE] <- NA
+```
+
+```{r}
+#Vectorize mask
+blackout_mask_vec <- st_as_sf(blackout_mask)
+
+#Fix broken polygons
+blackout_mask_vec <- st_make_valid(blackout_mask_vec)
+
+#remove clutter
+rm(mosaic_diff, blackout_mask)
+```
+
+## Crop and Project Blackout Map to Region of Interest (Houston, TX)
+```{r}
+#Crop blackout_mask_vec to ROI (Houston)
+roi_box = st_polygon((list(rbind(c(-96.5,29), c(-96.5,30.5), c(-94.5,30.5), c(-94.5,29),c(-96.5,29)))))
+
+roi = st_sfc(roi_box, crs = 4326)
+
+#remove clutter
+rm(roi_box)
+```
+
+```{r}
+#subset vectorized blackout mask for Houston ROI
+blackout_mask_vec = blackout_mask_vec[roi, op = st_intersects]
+
+#project to NAD83 to match other data sets
+blkout_mask_nad83 = st_transform(blackout_mask_vec, crs = 3083)
+```
+
+## Identifying Highways
+```{r}
+#Query Houston highways from Texas roads data
+query <- "SELECT * FROM gis_osm_roads_free_1 WHERE fclass in ('motorway', 'motorway_link', 'primary', 'primary_link')"
+
+highways <- st_read(here("data", "gis_osm_roads_free_1.gpkg"), query = query)
+
+#Project crs to NAD83
+highways_nad83 = st_transform(highways, crs = 3083)
+```
+
+```{r}
+#Buffer and dissolve to identify area 200m on either side of hwys
+hwy_buffer <- st_buffer(highways_nad83, dist=200, joinStyle = "ROUND")
+hwy_buffer_dis <- st_union(hwy_buffer)
+plot(hwy_buffer_dis, reset = FALSE)
+```
+
+## Selecting Houses in the Houston Metropolitan Area
+```{r}
+#Query residential buildings from buildings data
+query <- "SELECT * 
+          FROM gis_osm_buildings_a_free_1
+          WHERE (type IS NULL AND name IS NULL)
+          OR type in ('residential', 'apartments','house', 'static_caravan', 'detached')"
+buildings <- st_read(here("data", "gis_osm_buildings_a_free_1.gpkg"), query = query)
+buildings_nad83 = st_transform(buildings, crs = 3083)
+```
+
+## Census Tract Data
+### Analyze Census data for Hispanic or Latino Origin
+
+```{r}
+#Read in census data for median income (example)
+acs_geoms <- st_read(here("data", "ACS_2019_5YR_TRACT_48_TEXAS.gdb"),
+                  layer = "ACS_2019_5YR_TRACT_48_TEXAS")
+acs_median_income <- st_read(here("data", "ACS_2019_5YR_TRACT_48_TEXAS.gdb"),
+                      layer = "X19_INCOME")
+```
+ 
+```{r}
+#Read in census data
+acs_geoms <- st_read(here("data", "ACS_2019_5YR_TRACT_48_TEXAS.gdb"),
+                  layer = "ACS_2019_5YR_TRACT_48_TEXAS")
+
+#Explore contents of geodatabase using st_layers
+acs_layers <- st_layers(here("data", "ACS_2019_5YR_TRACT_48_TEXAS.gdb"))
+
+#Read in data for Hispanic or Latino origins 
+acs_hispanic <- st_read(here("data", "ACS_2019_5YR_TRACT_48_TEXAS.gdb"),
+                      layer = "X03_HISPANIC_OR_LATINO_ORIGIN")
+```
+
+
+```{r}
+#Extract Hispanic or Latino origin and join with geometries
+hispanic <- acs_hispanic[c("GEOID", "B03002e12")]
+hispanic_geoms <- left_join(hispanic, acs_geoms, by = c("GEOID"= "GEOID_Data"))
+hispanic_geoms_sf <- st_as_sf(hispanic_geoms)
+hispanic_nad83 = st_transform(hispanic_geoms_sf, crs = 3083)
+```
+
+
+## Merge the Datasets
+```{r}
+#Remove highway buffer from vectorized blackout mask
+blkout_nohwys <- st_difference(blkout_mask_nad83,hwy_buffer_dis)
+
+plot(blkout_nohwys)
+```
+
+```{r}
+plot(buildings_nad83)
+```
+
+```{r}
+#Spatially subset residential buildings that experienced blackouts
+blkout_buildings <- buildings_nad83[blkout_nohwys, op = st_intersects]
+
+#Create layer of residential buildings didn't experienced blackouts or recovered by Feb 15th
+blkout_buildings_dis <- st_union(blkout_buildings)
+buildings_nad83_dis <- st_union(buildings_nad83)
+```
+
+```{r}
+blackout_hispanic <- st_join(blkout_buildings, hispanic_nad83, join = st_intersects)
+```
+
+
+## Question 1: How many residential buildings were without power on 2021-02-16?
+```{r}
+#Calculate number of blackout buildings
+(numofblkoutbuildings = length(unique(blkout_buildings$osm_id)))
+```
+
+## Map of Black Out vs. Recovered Building in Houston, Texas 
+### Create a map of the locations where buildings stayed blacked out versus buildings that never lost power. 
+```{r}
+tm_shape(blkout_buildings) +
+  tm_polygons() +
+  tm_scale_bar(position = c(.55, .1), bg.color = "white") +
+  tm_compass(type = "4star", position = c(0, .75), size = 3) +
+  tm_layout(main.title = "Blackouts on 2/16 in Houston, TX",
+            frame.lwd = .5) +
+
+  tm_polygons(roi) +
+  tm_scale_bar(position = c(0.55, 0.1), bg.color = "white") +
+  tm_compass(type = "4star", position = c(0, 0.75), size = 3) +
+  tm_legend(legend.outside = TRUE, legend.outside.position = "right") +
+  tm_layout(main.title = "Blackouts Caused by Winter Storms in Houston, TX",
+            frame.lwd = 0.5) +
+  tm_credits("Sources: NASA’s Level-1 and Atmosphere Archive & Distribution System Distributed Active Archive Center, OpenStreetMap, and the U.S. Census Bureau’s American Community Survey", size = 3, align = "center", bg.color = "white")
+```
+
+### **Figure 1.** Areas of metropolitan Houston that experienced power outages as a result of severe winter storms in Feburary 2021. Gray areas indicate places that experienced blackouts. 
+
+
+
+
+## Map of Populations of Hispanic and Latino by Origin 
+```{r}
+# Create static map in tmap of people who identify as Hispanic/Latino
+tmap::tmap_mode(mode = "plot") +
+tm_shape(hispanic_nad83, bbox = (st_bbox(roi))) +
+  tm_borders("black", lwd = .7) +
+  tm_fill(col = "B03002e12", textNA = 0, colorNA = "gray", breaks = seq(from = 0, to = 35000, by = 3500),
+          palette = "RdPu", n = 10, title = "Population of Hispanic or Latino Origin") +
+  tm_legend(legend.outside = TRUE, legend.outside.position = "right") +
+  tm_layout(main.title = "Population of Hispanic and Latino by Origin in Houston, TX",
+            frame.lwd = .5) +
+  tm_credits("Sources: NASA’s Level-1 and Atmosphere Archive & Distribution System Distributed Active Archive Center, OpenStreetMap, and the U.S. Census Bureau’s American Community Survey", size = 3, align = "center", bg.color = "white")
+```
+
+### **Figure 2.** Areas of metropolitan Houston that identify as Hispanic or Latino (pinks). Data retrived from the 2019 census tract data.
+
+
+
+## Map of Blackouts and Hispanic/Latino Origin in Houston, TX 
+### Bonus question: Is there a socioeconomic metric that predicts being affected by the power outage?
+```{r}
+# Create static map in tmap of blackouts and minority groups
+jpeg(file="blackout_houston.jpeg", width = 8, height = 8, units = 'in', res = 1000)
+tmap::tmap_mode(mode = "plot") +
+tm_shape(hispanic_nad83, bbox = (st_bbox(roi))) +
+  tm_borders("gray", lwd = .1) +
+  tm_fill(col = "B03002e12", textNA = 0, colorNA = "gray", breaks = seq(from = 0, to = 35000, by = 3500),
+          palette = "RdPu", n = 10, title = "Population of Hispanic or Latino Origin") +
+
+tm_shape(blkout_buildings) +
+  tm_polygons() +
+  tm_scale_bar(position = c(.55, .1), bg.color = "white") +
+  tm_compass(type = "4star", position = c(0, .75), size = 3) +
+  tm_legend(legend.outside = TRUE, legend.outside.position = "right") +
+  tm_layout(main.title = "Areas of Blackouts due to Feb 2021 Winter Storms\noverlayed on Hispanic/Latino Origin Pop. in Houston, TX",
+            frame.lwd = .5) +
+  tm_credits("Sources: NASA’s Level-1 and Atmosphere Archive & Distribution System Distributed Active Archive Center, OpenStreetMap, and the U.S. Census Bureau’s American Community Survey", size = 3, align = "center", bg.color = "white") +
+  tm_borders("black", lwd = .1) +
+  tm_fill(col = "black", alpha = 0.2)
+
+```
+
+### **Figure 3.** Areas of metropolitan Houston that experienced blackouts during the winter storms of February 2021 (dark gray) and the population of people that identify as Hispanic or Latino (pinks).
+
+Visual examination indicates that areas with higher population of hispanic/latino have more blackout buildings.
+This is most evident in the western and northwestern census tracts that were hit the hardest.
+
+
+## Summarize number of blacked out buildings by census tract
+```{r}
+tract_summary <- blackout_hispanic %>%
+  group_by(TRACTCE,B03002e12) %>%
+  summarize(count_by_tract =  n())
+```
+### Quick visualization to confirm visual trends in map
+```{r}
+ggplot(tract_summary, aes(x=B03002e12, y=count_by_tract)) + 
+  geom_point() +
+  labs(title = "Houston Blackout Buildings on 2/16 and Hispanic/Latino Population by Census Tract")+
+       xlab("Hispanic/Latino Population by Census Tract") +
+       ylab("Number of Blackout Buildings on 2/16")
+```
+
+With the loosely positive correlation, the scatterplot is consistent with observations from the map.
+However, a more rigorous numerical analysis is recommended to confirm this. 
+We would recommend redoing a similar analysis using population percentage rather than population numbers.
+
+```{r}
+write.csv(blkout_buildings,here("blkout_buildings.csv"), row.names = FALSE)
+write.csv(hispanic_nad83,here("hispanic_nad83.csv"), row.names = FALSE)
+```
+
